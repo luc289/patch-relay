@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Dépendances applicatives : les mises à jour de sécurité sont ouvertes
+  # automatiquement (alertes Dependabot), les mises à jour de version chaque semaine.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    labels: [dependencies, security]
+    commit-message:
+      prefix: "fix(deps)"
+
+  # Actions GitHub utilisées par les pipelines
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels: [dependencies, ci]
