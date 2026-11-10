@@ -1,0 +1,187 @@
+name: Deploy
+
+# Chaîne de livraison dev -> préprod -> prod.
+# Avant la prod, un changement ServiceNow est créé :
+#   - correctif Dependabot patch/minor sans résiduel bloquant -> changement à faible
+#     risque, standard (préapprouvé) si un modèle est configuré ;
+#   - tout autre cas -> changement normal, en attente d'approbation dans ServiceNow.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+    inputs:
+      origin:
+        description: "Origine de la livraison (dependabot | manual)"
+        default: manual
+      pr_number:
+        description: "Numéro de la PR"
+        default: ""
+      update_type:
+        description: "Type de mise à jour Dependabot"
+        default: ""
+      dependencies:
+        description: "Dépendances mises à jour"
+        default: ""
+      advisories:
+        description: "Avis de sécurité (GHSA/CVE)"
+        default: ""
+      changed_files:
+        description: "Fichiers modifiés (un par ligne)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  ORIGIN: ${{ inputs.origin || 'manual' }}
+  PR_NUMBER: ${{ inputs.pr_number }}
+  UPDATE_TYPE: ${{ inputs.update_type }}
+  DEPENDENCIES: ${{ inputs.dependencies }}
+  ADVISORIES: ${{ inputs.advisories }}
+
+jobs:
+  build-scan:
+    runs-on: ubuntu-latest
+    outputs:
+      risk: ${{ steps.gate.outputs.risk }}
+      eligible: ${{ steps.gate.outputs.eligible }}
+      reasons: ${{ steps.gate.outputs.reasons }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+
+      - name: Analyse des vulnérabilités (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          format: json
+          output: trivy.json
+          exit-code: "0"
+
+      - name: Fichiers modifiés
+        id: files
+        env:
+          INPUT_FILES: ${{ inputs.changed_files }}
+        run: |
+          {
+            echo "list<<EOF"
+            if [ -n "$INPUT_FILES" ]; then printf '%s\n' "$INPUT_FILES"; else git diff --name-only HEAD~1 HEAD || true; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Risk gate
+        id: gate
+        env:
+          TRIVY_REPORT: trivy.json
+          CHANGED_FILES: ${{ steps.files.outputs.list }}
+          MAX_SEVERITY: MEDIUM
+        run: node scripts/risk-gate.js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ github.run_id }}
+          path: trivy.json
+
+  deploy-dev:
+    needs: build-scan
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci --omit=dev
+      - name: Déploiement simulé + sonde de santé
+        env: { APP_ENV: dev }
+        run: bash scripts/simulate-deploy.sh
+
+  deploy-preprod:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: preprod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci --omit=dev
+      - name: Déploiement simulé + sonde de santé
+        env: { APP_ENV: preprod }
+        run: bash scripts/simulate-deploy.sh
+
+  change-gate:
+    name: Changement ServiceNow (prod)
+    needs: [build-scan, deploy-preprod]
+    runs-on: ubuntu-latest
+    outputs:
+      sys_id: ${{ steps.create.outputs.change_sys_id }}
+      number: ${{ steps.create.outputs.change_number }}
+    env:
+      SN_INSTANCE: ${{ vars.SN_INSTANCE }}
+      SN_USER: ${{ secrets.SN_USER }}
+      SN_PASSWORD: ${{ secrets.SN_PASSWORD }}
+      SN_STD_TEMPLATE_ID: ${{ vars.SN_STD_TEMPLATE_ID }}
+      SN_CMDB_CI: ${{ vars.SN_CMDB_CI }}
+      SN_ASSIGNMENT_GROUP: ${{ vars.SN_ASSIGNMENT_GROUP }}
+      ENV_NAME: prod
+      RISK: ${{ needs.build-scan.outputs.risk }}
+      ELIGIBLE: ${{ needs.build-scan.outputs.eligible }}
+      RISK_REASONS: ${{ needs.build-scan.outputs.reasons }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - name: Créer le changement
+        id: create
+        run: node scripts/servicenow-change.js create
+
+      - name: Attendre l'approbation
+        env:
+          CHANGE_SYS_ID: ${{ steps.create.outputs.change_sys_id }}
+          WAIT_MINUTES: "60"
+        run: node scripts/servicenow-change.js wait
+
+  deploy-prod:
+    needs: change-gate
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      SN_INSTANCE: ${{ vars.SN_INSTANCE }}
+      SN_USER: ${{ secrets.SN_USER }}
+      SN_PASSWORD: ${{ secrets.SN_PASSWORD }}
+      CHANGE_SYS_ID: ${{ needs.change-gate.outputs.sys_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci --omit=dev
+
+      - name: Changement en Implement
+        run: node scripts/servicenow-change.js implement
+
+      - name: Déploiement simulé + sonde de santé
+        id: deploy
+        env: { APP_ENV: prod }
+        run: bash scripts/simulate-deploy.sh
+
+      - name: Fermer le changement
+        if: always()
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+        run: node scripts/servicenow-change.js close
