@@ -1,0 +1,113 @@
+name: CI
+
+# Contrôles exécutés sur chaque PR. Pour les PR Dependabot, la fusion est
+# automatique dès que les contrôles passent (aucune revue humaine configurée),
+# puis le pipeline de déploiement est déclenché.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+
+      - name: npm audit (rapport)
+        run: npm audit --audit-level=high || true
+
+      - name: Analyse des vulnérabilités (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          format: json
+          output: trivy.json
+          exit-code: "0"
+
+      - name: Risk gate (indicatif sur la PR)
+        env:
+          TRIVY_REPORT: trivy.json
+          ORIGIN: ${{ github.actor == 'dependabot[bot]' && 'dependabot' || 'manual' }}
+          UPDATE_TYPE: ""
+        run: node scripts/risk-gate.js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-pr-${{ github.event.pull_request.number }}
+          path: trivy.json
+
+  auto-merge:
+    name: Fusion automatique (Dependabot)
+    needs: build-test-scan
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Métadonnées Dependabot
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fichiers modifiés
+        id: files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "list<<EOF"
+            gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --name-only
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Avis de sécurité cités dans la PR
+        id: adv
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          ids=$(printf '%s' "$BODY" | grep -oE '(GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}|CVE-[0-9]{4}-[0-9]+)' | sort -u | paste -sd ',' - || true)
+          echo "ids=${ids:-voir PR}" >> "$GITHUB_OUTPUT"
+
+      - name: Fusionner sans revue (squash)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
+
+      # Une fusion faite avec GITHUB_TOKEN ne déclenche pas l'événement push :
+      # le déploiement est donc lancé explicitement avec le contexte du correctif.
+      - name: Déclencher le pipeline de déploiement
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FILES: ${{ steps.files.outputs.list }}
+          PR: ${{ github.event.pull_request.number }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          DEPS: ${{ steps.meta.outputs.dependency-names }}
+          ADVISORIES: ${{ steps.adv.outputs.ids }}
+        # Les valeurs passent par des variables d'environnement (jamais
+        # interpolées dans le script) pour éviter l'injection de commandes.
+        run: |
+          gh workflow run deploy.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f origin=dependabot \
+            -f pr_number="$PR" \
+            -f update_type="$UPDATE_TYPE" \
+            -f dependencies="$DEPS" \
+            -f advisories="$ADVISORIES" \
+            -f changed_files="$FILES"
