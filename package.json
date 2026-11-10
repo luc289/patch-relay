@@ -1,0 +1,20 @@
+{
+  "name": "patch-relay",
+  "version": "1.0.0",
+  "description": "Service de démonstration : remédiation automatisée de vulnérabilités avec changement ServiceNow piloté par pipeline",
+  "main": "src/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js",
+    "risk-gate": "node scripts/risk-gate.js",
+    "change": "node scripts/servicenow-change.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "4.17.1"
+  },
+  "license": "MIT"
+}

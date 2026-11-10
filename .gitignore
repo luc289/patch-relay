@@ -1,0 +1,4 @@
+node_modules/
+trivy.json
+server.log
+.env
